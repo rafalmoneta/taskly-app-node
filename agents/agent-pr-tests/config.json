@@ -1,0 +1,48 @@
+{
+  "roles": {
+    "pr": {
+      "model": "anthropic/claude-sonnet-4-5",
+      "thinking": "off",
+      "softTurns": 35,
+      "hardTurns": 60,
+      "softUsd": 2.0,
+      "hardUsd": 4.0,
+      "wallClockMin": 25
+    }
+  },
+  "policy": {
+    "writable": [
+      "backend/tests/**/*.test.ts",
+      "backend/tests/**/fixture*.ts",
+      "frontend/src/**/*.test.ts",
+      "frontend/src/**/*.test.tsx",
+      "frontend/src/test/**"
+    ],
+    "forbidden": [
+      "**/node_modules/**",
+      "**/.git/**",
+      "agents/**",
+      ".github/**",
+      "**/*.config.*",
+      "**/package.json",
+      "**/package-lock.json",
+      "frontend/src/test/setup.ts"
+    ],
+    "maxViolations": 3,
+    "maxFilesPerRun": 8
+  },
+  "apps": {
+    "backend": {
+      "cwd": "backend",
+      "typecheck": ["npm", "run", "typecheck"],
+      "vitest": ["npx", "vitest", "run"],
+      "format": []
+    },
+    "frontend": {
+      "cwd": "frontend",
+      "typecheck": ["npm", "run", "typecheck"],
+      "vitest": ["npx", "vitest", "run"],
+      "format": ["npx", "prettier", "--write"]
+    }
+  }
+}

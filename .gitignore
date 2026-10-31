@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output and caches
+dist/
+storybook-static/
+.vite/
+*.tsbuildinfo
+backend/src/generated/prisma/
+
+# Test coverage
+coverage/
+
+# Local environment variables
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# Agent run artefacts (events.jsonl, result.json, patches)
+.artifacts*/
+# Pi writes a model-catalog cache next to models.json; never commit it
+agents/*/pi/models-store.json

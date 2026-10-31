@@ -1,0 +1,290 @@
+name: PR unit tests (agent)
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions: {}
+concurrency:
+  group: pr-unit-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  gate:
+    name: Decide whether the agent runs
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-test-agent')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.diff.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check what the PR changes
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # git diff --quiet exits 1 for a change and 128 for an error, and an
+          # error must stop the job instead of reading as "no change".
+          changed() {
+            local status=0
+            git diff --quiet "$BASE_SHA...HEAD" -- "$@" || status=$?
+            case "$status" in
+              0) return 1 ;;
+              1) return 0 ;;
+              *) exit "$status" ;;
+            esac
+          }
+          skip=
+          if changed agents/ .github/; then
+            skip=agent-changed
+          elif ! changed backend/ frontend/; then
+            skip=no-app-changes
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+  agent:
+    name: Write and verify tests
+    needs: gate
+    if: needs.gate.outputs.skip == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.result.outputs.outcome }}
+    env:
+      PI_OFFLINE: "1"
+      PI_SKIP_VERSION_CHECK: "1"
+      PI_TELEMETRY: "0"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # Pi's grep and find need rg and fd, and PI_OFFLINE=1 blocks the download
+      # that Pi would otherwise try. Pi also finds fd under the name fdfind.
+      - name: Install the search tools Pi needs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ripgrep fd-find
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            agents/agent-pr-tests/package-lock.json
+            backend/package-lock.json
+            frontend/package-lock.json
+      - name: Install the agent
+        run: npm ci --ignore-scripts --legacy-peer-deps
+        working-directory: agents/agent-pr-tests
+      - name: Check the model credentials
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::The repository secret ANTHROPIC_API_KEY is not set."
+            exit 1
+          fi
+      - name: Install the apps
+        run: |
+          npm ci --prefix backend
+          npm ci --prefix frontend
+      - name: Prepare the agent's inputs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: agents/agent-pr-tests/scripts/prepare-inputs.sh "$BASE_SHA"
+      # The agent reads this file and deletes it, so the commands that run
+      # the model's tests do not inherit the key.
+      - name: Store the model key for the agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$ANTHROPIC_API_KEY" > "$RUNNER_TEMP/agent-api-key"
+      - name: Run the test agent
+        continue-on-error: true
+        env:
+          AGENT_API_KEY_FILE: ${{ runner.temp }}/agent-api-key
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node agents/agent-pr-tests/src/run.ts --pr "$PR_NUMBER" --out .artifacts
+      - name: Export the agent's changes as a patch
+        run: |
+          git add -A
+          git diff --cached --binary --no-renames > .artifacts/tests.patch
+          git diff --cached --stat
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-unit-tests-${{ github.event.pull_request.number }}
+          path: .artifacts/
+          include-hidden-files: true
+          retention-days: 14
+      - name: Read the outcome
+        id: result
+        run: |
+          outcome=$(jq -r '.outcome // "none"' .artifacts/result.json 2>/dev/null || echo none)
+          echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
+  ci:
+    name: Run CI on the tests
+    needs: agent
+    if: needs.agent.outputs.outcome == 'verified'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
+      patch-artifact: pr-unit-tests-${{ github.event.pull_request.number }}
+  publish:
+    name: Publish the results
+    needs: [agent, ci]
+    if: ${{ !cancelled() && needs.agent.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: write
+    steps:
+      # The patch comes from a job that ran model-written code, so nothing in
+      # `pr` may run here. `trusted` holds the tooling. Its agents/ directory
+      # equals the merge base, because the gate skips a PR that changes it.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-unit-tests-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/agent
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: trusted/.nvmrc
+          cache: npm
+          cache-dependency-path: trusted/agents/agent-pr-tests/package-lock.json
+      - name: Install the publish tooling
+        run: npm ci --ignore-scripts --legacy-peer-deps
+        working-directory: trusted/agents/agent-pr-tests
+      - name: Commit the verified tests
+        id: push
+        working-directory: pr
+        env:
+          AGENT_DIR: ${{ runner.temp }}/agent
+          CI_RESULT: ${{ needs.ci.result }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OUTCOME: ${{ needs.agent.outputs.outcome }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -o pipefail
+          publish="$GITHUB_WORKSPACE/trusted/agents/agent-pr-tests/src/publish.ts"
+          if [ "$OUTCOME" = "verified" ] && [ "$CI_RESULT" = "success" ] && [ -s "$AGENT_DIR/tests.patch" ]; then
+            git apply --index "$AGENT_DIR/tests.patch"
+            git diff --cached --raw --no-renames -z | node "$publish" check
+            files=$(git diff --cached --name-only | wc -l)
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit -m "tests: added by agent - $files test file(s) for PR #$PR_NUMBER" \
+                       -m "The harness verified the tests with format, typecheck and a full test run."
+            git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Render the report
+        id: report
+        if: always()
+        env:
+          AGENT_DIR: ${{ runner.temp }}/agent
+          CI_RESULT: ${{ needs.ci.result }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          args=("$AGENT_DIR/result.json" --run-url "$RUN_URL" --ci "$CI_RESULT")
+          if [ "$PUSHED" = "true" ]; then args+=(--pushed); fi
+          node "$GITHUB_WORKSPACE/trusted/agents/agent-pr-tests/src/publish.ts" report "${args[@]}" > "$RUNNER_TEMP/report.md"
+          cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Update the PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          marker=$(head -n 1 "$RUNNER_TEMP/report.md")
+          comment_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate --slurp \
+            | jq -r --arg marker "$marker" \
+              'add // [] | map(select(.user.login == "github-actions[bot]" and (.body | startswith($marker)))) | first | .id // empty')
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@"$RUNNER_TEMP/report.md"
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@"$RUNNER_TEMP/report.md"
+          fi
+      - name: Create the check run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.push.outputs.sha || github.event.pull_request.head.sha }}
+          CONCLUSION: ${{ steps.report.outputs.conclusion }}
+          TITLE: ${{ steps.report.outputs.title }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" \
+            -f name="Unit test agent" -f head_sha="$HEAD_SHA" -f status=completed \
+            -f conclusion="$CONCLUSION" -f "output[title]=$TITLE" \
+            -F "output[summary]=@$RUNNER_TEMP/report.md"
+  skipped:
+    name: Explain the skip
+    needs: gate
+    if: needs.gate.outputs.skip != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      checks: write
+    # No checkout, because this job can write and the PR controls agents/ and
+    # .github/ when it changes them.
+    steps:
+      - name: Write the report
+        env:
+          SKIP: ${{ needs.gate.outputs.skip }}
+        run: |
+          case "$SKIP" in
+            agent-changed) reason="This PR changes \`agents/\` or \`.github/\`, so the test agent does not run on it." ;;
+            no-app-changes) reason="This PR does not change \`backend/\` or \`frontend/\`, so there is nothing to test." ;;
+          esac
+          printf '%s\n' '<!-- taskly-unit-test-agent -->' '## Unit test agent: Skipped' '' "$reason" > "$RUNNER_TEMP/report.md"
+      - name: Update the PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          marker=$(head -n 1 "$RUNNER_TEMP/report.md")
+          comment_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate --slurp \
+            | jq -r --arg marker "$marker" \
+              'add // [] | map(select(.user.login == "github-actions[bot]" and (.body | startswith($marker)))) | first | .id // empty')
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@"$RUNNER_TEMP/report.md"
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@"$RUNNER_TEMP/report.md"
+          fi
+      - name: Create the check run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" \
+            -f name="Unit test agent" -f head_sha="$HEAD_SHA" -f status=completed \
+            -f conclusion=neutral -f "output[title]=Skipped" \
+            -F "output[summary]=@$RUNNER_TEMP/report.md"

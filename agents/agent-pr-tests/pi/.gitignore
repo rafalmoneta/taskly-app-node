@@ -1,0 +1,9 @@
+# Pi runtime files are private. Only these reviewed resources belong in Git.
+/*
+!/.gitignore
+!/settings.json
+!/models.json
+!/APPEND_SYSTEM.md
+!/extensions/
+!/skills/
+!/prompts/

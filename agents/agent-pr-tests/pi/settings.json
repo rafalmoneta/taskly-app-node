@@ -1,0 +1,19 @@
+{
+  "$schema": "https://pi.dev/schemas/settings.schema.json",
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-4-5",
+  "defaultTools": ["read", "grep", "find", "ls", "edit", "write"],
+  "defaultThinkingLevel": "off",
+  "defaultProjectTrust": "never",
+  "retry": {
+    "enabled": true,
+    "maxRetries": 3,
+    "baseDelayMs": 2000
+  },
+  "compaction": {
+    "enabled": true
+  },
+  "enableInstallTelemetry": false,
+  "enableAnalytics": false,
+  "cacheWarming": "off"
+}
