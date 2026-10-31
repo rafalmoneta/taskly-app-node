@@ -5,7 +5,7 @@ import { createTodosRouter } from '../src/features/todos/router.ts';
 import { todo } from './fixture.ts';
 
 function setup() {
-  const repository = { list: vi.fn().mockResolvedValue([todo]), create: vi.fn().mockResolvedValue(todo), get: vi.fn(), update: vi.fn(), delete: vi.fn() };
+  const repository = { list: vi.fn().mockResolvedValue([todo]), create: vi.fn().mockResolvedValue(todo), get: vi.fn(), update: vi.fn(), delete: vi.fn(), deleteCompleted: vi.fn() };
   const app = express();
   app.use(express.json());
   app.use('/api/todos', createTodosRouter(repository));
@@ -32,3 +32,11 @@ it.each([{ title: '  ' }, { title: 'x'.repeat(121) }, { title: 'Task', priority:
     expect(repository.create).not.toHaveBeenCalled();
   },
 );
+it('clears completed tasks', async () => {
+  const { app, repository } = setup();
+  repository.deleteCompleted.mockResolvedValue(5);
+  const response = await request(app).delete('/api/todos/completed');
+  expect(response.status).toBe(200);
+  expect(response.body).toEqual({ deleted: 5 });
+  expect(repository.deleteCompleted).toHaveBeenCalledOnce();
+});
